@@ -13,7 +13,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "AI-VS-AI Kedy Savaşçısı 7/24 Aktif!"
+    return "Adım Adım Kedy Savaşçısı 7/24 Aktif!"
 
 @app.route('/health')
 def health():
@@ -33,8 +33,8 @@ user_memory = {}
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 KEDY_API_KEY = os.environ.get("KEDY_API_KEY")
 
-# --- 3. TEMEL KEDY API ÇAĞRISI ---
-async def call_kedy(messages: list, temperature: float = 0.5):
+# --- 3. KEDY API ÇAĞRISI ---
+async def call_kedy(messages: list, temperature: float = 0.4):
     url = "https://api.kedy.dev/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {KEDY_API_KEY}",
@@ -57,22 +57,50 @@ async def call_kedy(messages: list, temperature: float = 0.5):
         print(f"API Hatası: {e}")
         return None
 
-# --- 4. HAKEM KEDY (CEVABI DENETLEYEN İKİNCİ AI) ---
-async def judge_response(original_prompt: str, current_generated_text: str) -> bool:
-    """İkinci Kedy API'si üretilen cevabın yeterli/mantıklı olup olmadığını denetler."""
-    judge_prompt = [
+# --- 4. 1. AŞAMA: KEDY'NİN KENDİ ADIM SAYISINI BELİRLEMESİ ---
+async def determine_step_count(clean_prompt: str) -> int:
+    """Kedy'nin cevabı kaç adımda (5 ile 20 arası) bitireceğine karar vermesini sağlar."""
+    prompt = [
         {
             "role": "system",
-            "content": (
-                "Sen acımasız bir edat ve mantık denetleyicisisin. "
-                "Görevin verilen kullanıcının isteği ile üretilen cevabı kıyaslamak. "
-                "Eğer cevap mantıklı, istek ile uyumlu ve tamamlanmış bir cümle/paragraf ise SADECE 'TAMAM' yaz. "
-                "Eğer cevap yarım kalmışsa, saçmalamışsa, kendi içinde çelişiyorsa veya tamamlanmamışsa SADECE 'DEVAM' yaz."
-            )
+            "content": "Sen bir planlama asistanısın. Görevin sorulan soruya tam ve mantıklı bir cevap vermek için KAÇ ADIM (her adım maksimum 3 kelimedir) gerektiğini planlamaktır."
         },
         {
             "role": "user",
-            "content": f"Kullanıcı İsteği: {original_prompt}\n\nÜretilen Cevap: {current_generated_text}\n\nKararın (TAMAM / DEVAM):"
+            "content": (
+                f"Kullanıcı İsteği: '{clean_prompt}'\n\n"
+                "Bu isteğe kelime kelime (her adımda en fazla 3 kelime olacak şekilde) cevap vermek için "
+                "5 ile 20 arasında kaç adıma ihtiyacın var? "
+                "SADECE 5 ile 20 arasında bir SAYI yaz. Başka hiçbir kelime yazma!"
+            )
+        }
+    ]
+    
+    result = await call_kedy(prompt, temperature=0.2)
+    try:
+        # Metin içindeki sayıyı çek
+        import re
+        numbers = re.findall(r'\d+', result)
+        if numbers:
+            step_val = int(numbers[0])
+            # 5 ile 20 arasında sınırla
+            return max(5, min(20, step_val))
+    except Exception:
+        pass
+    
+    return 8  # Varsayılan sayı
+
+# --- 5. 2. AŞAMA: HAKEM KEDY (DENETLEYİCİ) ---
+async def judge_response(original_prompt: str, current_text: str) -> bool:
+    """Hakem Kedy cümlenin/cevabın erken bitip bitmediğini denetler."""
+    judge_prompt = [
+        {
+            "role": "system",
+            "content": "Görevin üretilen cevabın kullanıcı isteğini tam ve eksiksiz karşılayıp karşılamadığını denetlemektir. SADECE 'TAMAM' veya 'DEVAM' yaz."
+        },
+        {
+            "role": "user",
+            "content": f"Kullanıcı İsteği: {original_prompt}\nŞu Anki Cevap: {current_text}\n\nEğer bu cevap mantıklı, eksiksiz ve dilbilgisine uygun bittiysa 'TAMAM', devam etmesi gerekiyorsa 'DEVAM' yaz:"
         }
     ]
     
@@ -81,26 +109,29 @@ async def judge_response(original_prompt: str, current_generated_text: str) -> b
         return True
     return False
 
-# --- 5. İŞÇİ KEDY DÖNGÜSÜ (KELİME/CÜMLE ADIMLI ZORLAMA) ---
+# --- 6. ADIM ADIM ZORLAMALI ÜRETİM DÖNGÜSÜ ---
 async def generate_step_by_step(user_name: str, clean_prompt: str, memory: str) -> str:
-    """Modeli adım adım sonraki kelimeleri/cümleleri üretmeye zorlayan ana döngü."""
-    accumulated_response = ""
-    max_steps = 8  # Maksimum döngü sayısı (Sonsuz döngüyü engellemek için)
+    # Adım 1: Kedy kendisi hedef adım sayısını seçsin (5 - 20)
+    target_steps = await determine_step_count(clean_prompt)
+    print(f"[PLANLAMA] Kedy bu cevap için {target_steps} adım hedefledi.")
 
-    for step in range(max_steps):
-        # Her adımda Orijinal Prompt + Hafıza + Şu ana kadar üretilen tüm metin inputa basılır
+    accumulated_text = ""
+
+    for step in range(1, target_steps + 1):
         system_instructions = (
-            "Sen samimi bir Discord üyesisin. "
-            "Sana verilen isteme ve şu ana kadar yazdığın metne tam bağlı kal. "
-            "Şu ana kadar yazdığın metnin KALDIĞI YERDEN devam et. Asla baştan başlama veya kendini tekrarlama."
+            "Sen samimi bir Discord arkadaşısın. "
+            "Görevin kullanıcının isteğine adım adım cevap yazmaktır. "
+            "ÇOK ÖNEMLİ KURAL: Her adımda EN FAZLA 1 İLA 3 KELİME yazabilirsin! Asla uzun cümle kurma."
         )
 
         user_content = (
-            f"Kullanıcı Adı: {user_name}\n"
-            f"Kullanıcı Hakkındaki Hafıza: {memory}\n"
-            f"Kullanıcının Orijinal İsteği: {clean_prompt}\n\n"
-            f"Şu Ana Kadar Yazdığın Metin: '{accumulated_response}'\n\n"
-            f"TALİMAT: Yukarıdaki 'Şu Ana Kadar Yazdığın Metin' kısmını tam olarak devam ettirecek sonraki 1-2 cümleyi yaz."
+            f"Kullanıcı: {user_name}\n"
+            f"Kullanıcı Hafızası: {memory}\n"
+            f"Orijinal İstek: {clean_prompt}\n"
+            f"TOPLAM PLANLANAN ADIM: {target_steps}\n"
+            f"ŞU ANKİ ADIM: {step}/{target_steps}\n"
+            f"ŞU ANA KADAR YAZILAN METİN: '{accumulated_text}'\n\n"
+            "TALİMAT: 'Şu Ana Kadar Yazılan Metin' kısmını tam kaldığı yerden devam ettirecek MAX 3 KELİME yaz. Sadece eklenecek 1-3 kelimeyi yaz!"
         )
 
         messages = [
@@ -108,26 +139,30 @@ async def generate_step_by_step(user_name: str, clean_prompt: str, memory: str) 
             {"role": "user", "content": user_content}
         ]
 
-        next_chunk = await call_kedy(messages, temperature=0.6)
+        next_words = await call_kedy(messages, temperature=0.5)
 
-        if not next_chunk:
+        if not next_words:
             break
 
-        # Üretilen parçayı birleştir
-        accumulated_response += " " + next_chunk.strip()
-        accumulated_response = accumulated_response.strip()
+        # Sadece ilk 3 kelimeyi al (Sınırı aşarsa zorla kes)
+        words = next_words.strip().split()[:3]
+        chunk = " ".join(words)
 
-        # Hakem Kedy'ye soruyoruz: Cevap yeterli mi?
-        is_sufficient = await judge_response(clean_prompt, accumulated_response)
-        if is_sufficient:
-            print(f"[HAKEM ONAYLADI] {step + 1}. adımda cevap tamamlandı.")
-            break
-        else:
-            print(f"[HAKEM REDDETTİ] {step + 1}. adım yetersiz, devam ediliyor...")
+        accumulated_text += " " + chunk
+        accumulated_text = accumulated_text.strip()
 
-    return accumulated_response if accumulated_response else "Bir şeyler ters gitti ya, tekrar desene."
+        print(f"[ADIM {step}/{target_steps}]: + '{chunk}' -> BİRİKEN: '{accumulated_text}'")
 
-# --- 6. MESAJ DİNLEME ---
+        # 5. adımdan sonra Hakem Kedy'ye sor, erken bittiyse kes
+        if step >= 5:
+            is_done = await judge_response(clean_prompt, accumulated_text)
+            if is_done:
+                print(f"[HAKEM] Cevap {step}. adımda tam anlamıyla bittiği için erken durduruldu.")
+                break
+
+    return accumulated_text if accumulated_text else "Kafam durdu ya, tekrar desene."
+
+# --- 7. MESAJ DİNLEME ---
 @bot.event
 async def on_message(message):
     if message.author.bot:
@@ -150,21 +185,19 @@ async def on_message(message):
                 await message.reply("Efendim?")
                 return
 
-            hafiza = user_memory.get(user_id, "Henüz özel bir detay yok.")
+            hafiza = user_memory.get(user_id, "Henüz özel detay yok.")
 
-            # AI vs AI Döngüsünü başlat
+            # Savaş Alanı Çalışıyor
             final_response = await generate_step_by_step(user_name, clean_content, hafiza)
 
-            # Hafızayı güncelle
             user_memory[user_id] = f"Kullanıcı en son '{clean_content}' dedi."
-
             await message.reply(final_response)
 
-# --- 7. KOMUTLAR ---
+# --- 8. KOMUTLAR ---
 @bot.command(name="hafizam")
 async def hafizam(ctx):
     user_id = str(ctx.author.id)
-    hafiza = user_memory.get(user_id, "Hafıza henüz boş!")
+    hafiza = user_memory.get(user_id, "Hafıza boş!")
     embed = discord.Embed(title=f"🧠 {ctx.author.display_name} - Hafıza Logu", description=hafiza, color=discord.Color.blue())
     await ctx.send(embed=embed)
 
@@ -175,7 +208,7 @@ async def hafizamisil(ctx):
         del user_memory[user_id]
     await ctx.send("🧠 Hafıza temizlendi!")
 
-# --- 8. BAŞLATICI ---
+# --- 9. BAŞLATICI ---
 if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
