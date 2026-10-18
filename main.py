@@ -5,6 +5,7 @@ import threading
 import discord
 from discord.ext import commands
 import aiohttp
+import urllib.parse
 from flask import Flask
 from waitress import serve
 
@@ -28,13 +29,40 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Kişi bazlı basit hafıza deposu
 user_memory = {}
 
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 KEDY_API_KEY = os.environ.get("KEDY_API_KEY")
 
-# --- 3. DÜZ KEDY API ÇAĞRISI (TEK INPUT -> TEK OUTPUT) ---
+# --- 3. HIZLI WEB ARAMA/ÖZET ÇEKİCİ ---
+async def fetch_web_overview(query: str) -> str:
+    """Mesajdaki arama sorgusunu web üzerinde aratıp özet getirir."""
+    try:
+        encoded_query = urllib.parse.quote(query)
+        url = f"https://api.duckduckgo.com/?q={encoded_query}&format=json&no_html=1&skip_disambig=1"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    abstract = data.get("AbstractText", "")
+                    if abstract:
+                        return abstract
+                    
+                    # Eğer doğrudan özet gelmezse sonuç başlıklarından derle
+                    related = data.get("RelatedTopics", [])
+                    snippets = []
+                    for item in related[:3]:
+                        if isinstance(item, dict) and "Text" in item:
+                            snippets.append(item["Text"])
+                    if snippets:
+                        return " ".join(snippets)
+    except Exception as e:
+        print(f"Web Arama Hatası: {e}")
+    
+    return "Web araması yapıldı ancak anlamlı bir özet veri bulunamadı."
+
+# --- 4. DÜZ KEDY API ÇAĞRISI ---
 async def call_kedy_ai(messages: list):
     url = "https://api.kedy.dev/v1/chat/completions"
     headers = {
@@ -59,13 +87,14 @@ async def call_kedy_ai(messages: list):
         print(f"API Hatası: {e}")
         return None
 
-# --- 4. MESAJ DİNLEME VE SOHBET ---
+# --- 5. MESAJ DİNLEME VE SOHBET ---
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
 
-    if message.content.startswith('!'):
+    # Sadece !hafizam ve !hafizamisil gibi komutların çalışması için
+    if message.content.startswith('!') and not message.content.startswith('!websearch'):
         await bot.process_commands(message)
         return
 
@@ -83,7 +112,21 @@ async def on_message(message):
                 await message.reply("Efendim?")
                 return
 
-            # Sadece hafıza bilgisini al ve prompta sabitle
+            # Web Arama Kontrolü
+            web_context = ""
+            if "!websearch" in clean_content.lower():
+                # '!websearch' ifadesini mesajdan ayıklayıp arama kelimesini alıyoruz
+                search_query = clean_content.lower().replace("!websearch", "").strip()
+                if not search_query:
+                    search_query = clean_content # Eğer ek arama kelimesi yoksa tüm mesajı arat
+                
+                web_overview = await fetch_web_overview(search_query)
+                web_context = f"\n[WEB ARAMA ÖZETİ (GÜNCEL BİLGİ)]: {web_overview}\n"
+                
+                # Temiz içerikten !websearch ekini kaldır
+                clean_content = clean_content.replace("!websearch", "").strip()
+
+            # Hafıza logunu al
             hafiza = user_memory.get(user_id, "Henüz özel bir kayıt yok.")
 
             messages = [
@@ -91,7 +134,8 @@ async def on_message(message):
                     "role": "system",
                     "content": (
                         "Sen bir Discord asistanısın. "
-                        f"Kullanıcı Hakkındaki Hafıza Logun: [{hafiza}]"
+                        f"Kullanıcı Hafıza Logu: [{hafiza}]"
+                        f"{web_context}"
                     )
                 },
                 {
@@ -105,12 +149,11 @@ async def on_message(message):
 
             if cevap:
                 await message.reply(cevap)
-                # Hafıza logunu son sohbetle güncelle
                 user_memory[user_id] = f"Kullanıcı en son '{clean_content}' dedi."
             else:
                 await message.reply("Şu an cevap veremiyorum.")
 
-# --- 5. HAFIZA KOMUTLARI ---
+# --- 6. HAFIZA KOMUTLARI ---
 @bot.command(name="hafizam")
 async def hafizam(ctx):
     user_id = str(ctx.author.id)
@@ -130,7 +173,7 @@ async def hafizamisil(ctx):
         del user_memory[user_id]
     await ctx.send("🧠 Hafıza temizlendi!")
 
-# --- 6. BAŞLATICI ---
+# --- 7. BAŞLATICI ---
 if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
