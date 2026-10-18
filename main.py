@@ -13,7 +13,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "AI Asistan 7/24 Aktif ve Operasyonel!"
+    return "AI-VS-AI Kedy Savaşçısı 7/24 Aktif!"
 
 @app.route('/health')
 def health():
@@ -28,15 +28,13 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# RAM içi hafıza deposu
 user_memory = {}
-temp_chat_history = {}
 
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 KEDY_API_KEY = os.environ.get("KEDY_API_KEY")
 
-# --- 3. KEDY AI ASENKRON İLETİŞİM FONKSİYONU ---
-async def call_kedy_ai(messages: list):
+# --- 3. TEMEL KEDY API ÇAĞRISI ---
+async def call_kedy(messages: list, temperature: float = 0.5):
     url = "https://api.kedy.dev/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {KEDY_API_KEY}",
@@ -45,61 +43,96 @@ async def call_kedy_ai(messages: list):
     payload = {
         "model": "novaq",
         "messages": messages,
-        "temperature": 0.5
+        "temperature": temperature
     }
     
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+            async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     return data['choices'][0]['message']['content']
-                else:
-                    print(f"API Hatası Status Code: {resp.status}")
-                    return None
+                return None
     except Exception as e:
-        print(f"Kedy API İletişim Hatası: {e}")
+        print(f"API Hatası: {e}")
         return None
 
-# --- 4. HAFIZA SIKIŞTIRMA (ÖZET ÇIKARMA) ---
-async def compress_memory(user_id: str, user_name: str):
-    if user_id not in temp_chat_history or not temp_chat_history[user_id]:
-        return
-
-    maddeler = "\n".join(temp_chat_history[user_id])
-    mevcut_hafiza = user_memory.get(user_id, "Henüz hafıza kaydı yok.")
-
-    prompt = f"""Kullanıcı Adı: '{user_name}'
-Mevcut Hafıza: {mevcut_hafiza}
-Son Konuşma Metinleri:
-{maddeler}
-
-Görevin: Kullanıcının son söylediklerinden yola çıkarak kendisi hakkında verdiği kişisel bilgileri (örn: kedi olduğunu söylemesi, sevdikleri, mesleği, hobileri vb.) kısa özet maddeler halinde güncelle.
-
-Kurallar:
-- Sadece kullanıcının söylediği somut bilgileri yaz.
-- Kısa, net 1-3 madde yaz.
-- Yapay zeka veya açıklama metinleri ekleme, direkt özet maddeleri ver.
-"""
-
-    messages = [
-        {"role": "system", "content": "Sen kullanıcılar hakkında kısa ve öz hafıza logları tutturan bir veri işleyicisisin."},
-        {"role": "user", "content": prompt}
+# --- 4. HAKEM KEDY (CEVABI DENETLEYEN İKİNCİ AI) ---
+async def judge_response(original_prompt: str, current_generated_text: str) -> bool:
+    """İkinci Kedy API'si üretilen cevabın yeterli/mantıklı olup olmadığını denetler."""
+    judge_prompt = [
+        {
+            "role": "system",
+            "content": (
+                "Sen acımasız bir edat ve mantık denetleyicisisin. "
+                "Görevin verilen kullanıcının isteği ile üretilen cevabı kıyaslamak. "
+                "Eğer cevap mantıklı, istek ile uyumlu ve tamamlanmış bir cümle/paragraf ise SADECE 'TAMAM' yaz. "
+                "Eğer cevap yarım kalmışsa, saçmalamışsa, kendi içinde çelişiyorsa veya tamamlanmamışsa SADECE 'DEVAM' yaz."
+            )
+        },
+        {
+            "role": "user",
+            "content": f"Kullanıcı İsteği: {original_prompt}\n\nÜretilen Cevap: {current_generated_text}\n\nKararın (TAMAM / DEVAM):"
+        }
     ]
+    
+    result = await call_kedy(judge_prompt, temperature=0.1)
+    if result and "TAMAM" in result.upper():
+        return True
+    return False
 
-    yeni_hafiza = await call_kedy_ai(messages)
-    if yeni_hafiza and yeni_hafiza.strip():
-        user_memory[user_id] = yeni_hafiza.strip()
-        print(f"[HAFIZA GÜNCELLENDİ - {user_name}]: {user_memory[user_id]}")
-        temp_chat_history[user_id] = []
+# --- 5. İŞÇİ KEDY DÖNGÜSÜ (KELİME/CÜMLE ADIMLI ZORLAMA) ---
+async def generate_step_by_step(user_name: str, clean_prompt: str, memory: str) -> str:
+    """Modeli adım adım sonraki kelimeleri/cümleleri üretmeye zorlayan ana döngü."""
+    accumulated_response = ""
+    max_steps = 8  # Maksimum döngü sayısı (Sonsuz döngüyü engellemek için)
 
-# --- 5. MESAJ DİNLEME VE SOHBET ---
+    for step in range(max_steps):
+        # Her adımda Orijinal Prompt + Hafıza + Şu ana kadar üretilen tüm metin inputa basılır
+        system_instructions = (
+            "Sen samimi bir Discord üyesisin. "
+            "Sana verilen isteme ve şu ana kadar yazdığın metne tam bağlı kal. "
+            "Şu ana kadar yazdığın metnin KALDIĞI YERDEN devam et. Asla baştan başlama veya kendini tekrarlama."
+        )
+
+        user_content = (
+            f"Kullanıcı Adı: {user_name}\n"
+            f"Kullanıcı Hakkındaki Hafıza: {memory}\n"
+            f"Kullanıcının Orijinal İsteği: {clean_prompt}\n\n"
+            f"Şu Ana Kadar Yazdığın Metin: '{accumulated_response}'\n\n"
+            f"TALİMAT: Yukarıdaki 'Şu Ana Kadar Yazdığın Metin' kısmını tam olarak devam ettirecek sonraki 1-2 cümleyi yaz."
+        )
+
+        messages = [
+            {"role": "system", "content": system_instructions},
+            {"role": "user", "content": user_content}
+        ]
+
+        next_chunk = await call_kedy(messages, temperature=0.6)
+
+        if not next_chunk:
+            break
+
+        # Üretilen parçayı birleştir
+        accumulated_response += " " + next_chunk.strip()
+        accumulated_response = accumulated_response.strip()
+
+        # Hakem Kedy'ye soruyoruz: Cevap yeterli mi?
+        is_sufficient = await judge_response(clean_prompt, accumulated_response)
+        if is_sufficient:
+            print(f"[HAKEM ONAYLADI] {step + 1}. adımda cevap tamamlandı.")
+            break
+        else:
+            print(f"[HAKEM REDDETTİ] {step + 1}. adım yetersiz, devam ediliyor...")
+
+    return accumulated_response if accumulated_response else "Bir şeyler ters gitti ya, tekrar desene."
+
+# --- 6. MESAJ DİNLEME ---
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
 
-    # Komut kontrolü
     if message.content.startswith('!'):
         await bot.process_commands(message)
         return
@@ -107,78 +140,42 @@ async def on_message(message):
     bot_mentioned = bot.user.mentioned_in(message) and not message.mention_everyone
     is_dm = isinstance(message.channel, discord.DMChannel)
 
-    user_id = str(message.author.id)
-    user_name = message.author.display_name
-
-    if user_id not in temp_chat_history:
-        temp_chat_history[user_id] = []
-
-    # Bota hitap edildiyse veya DM atıldıysa cevap ver
     if bot_mentioned or is_dm:
         async with message.channel.typing():
+            user_id = str(message.author.id)
+            user_name = message.author.display_name
             clean_content = message.content.replace(f'<@{bot.user.id}>', '').strip()
-            
-            # 1. Mesajı geçici geçmişe ekle
-            temp_chat_history[user_id].append(f"{user_name}: {clean_content}")
 
-            # 2. Önce hafızayı senkronize biçimde güncelle ki yanıtta da anında kullanabilsin
-            await compress_memory(user_id, user_name)
+            if not clean_content:
+                await message.reply("Efendim?")
+                return
 
-            hafiza = user_memory.get(user_id, "Bu kullanıcı hakkında henüz kaydedilmiş bir detay yok.")
+            hafiza = user_memory.get(user_id, "Henüz özel bir detay yok.")
 
-            messages = [
-                {
-                    "role": "system", 
-                    "content": (
-                        "Sen bu Discord sunucusunda takılan samimi, kasmayan ve gerçek bir üyesin. "
-                        "Asla 'Ben bir yapay zekayım', 'Asistanım' deme. "
-                        "Kullanıcı kedi olduğunu veya başka bir şey söylediğinde bunu hatırla ve doğal bir arkadaş gibi konuş."
-                    )
-                },
-                {
-                    "role": "user", 
-                    "content": f"Kullanıcı: {user_name}\nHakkında Bildiklerin (Hafıza Logu):\n{hafiza}\n\nKullanıcının Son Mesajı: {clean_content}"
-                }
-            ]
+            # AI vs AI Döngüsünü başlat
+            final_response = await generate_step_by_step(user_name, clean_content, hafiza)
 
-            cevap = await call_kedy_ai(messages)
+            # Hafızayı güncelle
+            user_memory[user_id] = f"Kullanıcı en son '{clean_content}' dedi."
 
-            if cevap:
-                await message.reply(cevap)
-            else:
-                await message.reply("Kafam karıştı ya, ne demiştin?")
+            await message.reply(final_response)
 
-# --- 6. HAFIZA KOMUTLARI ---
-
+# --- 7. KOMUTLAR ---
 @bot.command(name="hafizam")
 async def hafizam(ctx):
-    """Kullanıcının bot hafızasındaki sıkıştırılmış özetini gösterir."""
     user_id = str(ctx.author.id)
-    
-    # Hafıza boşsa geçici geçmişte işlenmemiş bir mesaj varsa hemen güncellemeyi dene
-    if user_id not in user_memory and user_id in temp_chat_history and temp_chat_history[user_id]:
-        await compress_memory(user_id, ctx.author.display_name)
-        
-    hafiza = user_memory.get(user_id, "Seninle ilgili henüz sıkıştırılmış bir hafıza kaydım yok, biraz sohbet edelim!")
-    
-    embed = discord.Embed(
-        title=f"🧠 {ctx.author.display_name} - Hafıza Logu",
-        description=hafiza,
-        color=discord.Color.blue()
-    )
+    hafiza = user_memory.get(user_id, "Hafıza henüz boş!")
+    embed = discord.Embed(title=f"🧠 {ctx.author.display_name} - Hafıza Logu", description=hafiza, color=discord.Color.blue())
     await ctx.send(embed=embed)
 
 @bot.command(name="hafizamisil")
 async def hafizamisil(ctx):
-    """Kullanıcının kendi hafıza logunu sıfırlar."""
     user_id = str(ctx.author.id)
     if user_id in user_memory:
         del user_memory[user_id]
-    if user_id in temp_chat_history:
-        temp_chat_history[user_id] = []
-    await ctx.send("🧠 Hakkındaki tüm hafıza loglarını temizledim!")
+    await ctx.send("🧠 Hafıza temizlendi!")
 
-# --- 7. BAŞLATICI ---
+# --- 8. BAŞLATICI ---
 if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
@@ -186,4 +183,4 @@ if __name__ == "__main__":
     if DISCORD_TOKEN:
         bot.run(DISCORD_TOKEN)
     else:
-        print("HATA: DISCORD_TOKEN tanımlı değil!")
+        print("HATA: DISCORD_TOKEN bulunamadı!")
