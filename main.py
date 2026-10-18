@@ -28,10 +28,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Kişi bazlı sıkıştırılmış hafıza: { "user_id": "Özetlenmiş hafıza metni..." }
 user_memory = {}
-
-# Kullanıcının son ham mesajları (Özet çıkarmak için geçici bellek)
 temp_chat_history = {}
 
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
@@ -65,8 +62,7 @@ async def call_kedy_ai(messages: list):
 
 # --- 4. HAFIZA SIKIŞTIRMA (ÖZET ÇIKARMA) ---
 async def compress_memory(user_id: str, user_name: str):
-    """Kullanıcının son konuşmalarını sıkıştırıp özet hafızaya dönüştürür."""
-    if user_id not in temp_chat_history or len(temp_chat_history[user_id]) < 4:
+    if user_id not in temp_chat_history or len(temp_chat_history[user_id]) < 2:
         return
 
     maddeler = "\n".join(temp_chat_history[user_id])
@@ -81,16 +77,20 @@ Yeni Konuşmalar:
 {maddeler}
 
 Kurallar:
-- Sadece kullanıcının sevdiği şeyleri, kişisel bilgilerini, takıldığı konuları ve ruh halini kısa cümlelerle logla.
-- Gereksiz selamlaşmaları veya önemsiz cümleleri at.
-- Maksimim 3-4 maddelik sıkıştırılmış bir özet çıkar.
-- Doğrudan yeni hafıza logunu yaz.
+- Kullanıcının kendisi hakkında söylediği şeyleri (örneğin kedi olduğunu söylemesi, sevdikleri, mesleği vb.) kısa ve net maddelerle yaz.
+- Yapay zeka kalıpları veya resmi açıklamalar ekleme.
+- Maksimum 3 madde yaz.
 """
 
-    yeni_hafiza = await call_kedy_ai([{"role": "user", "content": prompt}])
+    messages = [
+        {"role": "system", "content": "Sen sadece kullanıcı hakkında kısa öz özet çıkartan bir veri işleyicisisin."},
+        {"role": "user", "content": prompt}
+    ]
+
+    yeni_hafiza = await call_kedy_ai(messages)
     if yeni_hafiza:
         user_memory[user_id] = yeni_hafiza.strip()
-        temp_chat_history[user_id] = [] # Geçici sohbeti temizle
+        temp_chat_history[user_id] = [] # İşlenen sohbeti temizle
 
 # --- 5. MESAJ DİNLEME VE SOHBET ---
 @bot.event
@@ -98,46 +98,55 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    # Bot etiketlendi mi veya bota komut dışı mesaj mı atıldı?
+    # Komut kontrolü
+    if message.content.startswith('!'):
+        await bot.process_commands(message)
+        return
+
     bot_mentioned = bot.user.mentioned_in(message) and not message.mention_everyone
     is_dm = isinstance(message.channel, discord.DMChannel)
 
-    # Geçici sohbete ekle
     user_id = str(message.author.id)
     user_name = message.author.display_name
 
     if user_id not in temp_chat_history:
         temp_chat_history[user_id] = []
-    temp_chat_history[user_id].append(f"{user_name}: {message.content}")
 
     # Bota hitap edildiyse veya DM atıldıysa cevap ver
     if bot_mentioned or is_dm:
         async with message.channel.typing():
-            hafiza = user_memory.get(user_id, "Bu kullanıcı hakkında henüz geçmiş bilgi yok.")
+            # Etiket metnini temizle
+            clean_content = message.content.replace(f'<@{bot.user.id}>', '').strip()
+            temp_chat_history[user_id].append(f"{user_name}: {clean_content}")
 
-            system_prompt = f"""Sen bu Discord sunucusunda takılan, gerçek bir insan gibi samimi, sıcak, kasmayan ve zeki bir üyesin.
-Yapay zeka olduğunu sürekli vurgulama, resmi konuşma. Arkadaşınla sohbet eder gibi doğal, samimi Türkçe kullan.
+            hafiza = user_memory.get(user_id, "Bu kullanıcı hakkında henüz kaydedilmiş bir detay yok.")
 
-Karşındaki Kullanıcı: {user_name}
-Kullanıcı Hakkında Bildiklerin (Sıkıştırılmış Hafıza Logu):
-{hafiza}
+            # System ve User rollerini ayırarak modele gönderiyoruz (AI kimliğini engellemek için)
+            messages = [
+                {
+                    "role": "system", 
+                    "content": (
+                        "Sen bu Discord sunucusundaki samimi, kasmayan, espirili ve gerçek bir üyesin. "
+                        "Asla 'Ben bir yapay zekayım', 'Asistanım' veya 'Sana nasıl yardımcı olabilirim' deme. "
+                        "Sanki arkadaşınla sohbet ediyormuş gibi rahat konuş."
+                    )
+                },
+                {
+                    "role": "user", 
+                    "content": f"Kullanıcı Adı: {user_name}\nKullanıcı Hakkında Bildiklerin (Hafıza): {hafiza}\n\nKullanıcının Mesajı: {clean_content}"
+                }
+            ]
 
-Kullanıcının Son Mesajı: "{message.content}"
-
-Hafızandaki bilgileri doğal bir şekilde dikkate alarak arkadaşça cevap ver."""
-
-            cevap = await call_kedy_ai([{"role": "user", "content": system_prompt}])
+            cevap = await call_kedy_ai(messages)
 
             if cevap:
                 await message.reply(cevap)
+                temp_chat_history[user_id].append(f"Sen: {cevap}")
             else:
-                await message.reply("Kafam biraz karıştı ya, ne demiştin?")
+                await message.reply("Kafam karıştı ya, ne demiştin?")
 
-    # Her 5 mesajda bir arka planda hafızayı özetle
-    if len(temp_chat_history[user_id]) >= 5:
-        asyncio.create_task(compress_memory(user_id, user_name))
-
-    await bot.process_commands(message)
+            # Her etkileşimde hafızayı anında güncelle
+            await compress_memory(user_id, user_name)
 
 # --- 6. HAFIZA KOMUTLARI ---
 
